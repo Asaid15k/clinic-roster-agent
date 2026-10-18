@@ -1,0 +1,5 @@
+venv/
+.venv/
+clinic.db
+__pycache__/
+.env
