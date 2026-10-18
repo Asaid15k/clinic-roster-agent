@@ -1,6 +1,7 @@
 import time
 from flask import Flask, jsonify, request, render_template_string
 from db import get_db
+from ui import HOME, install
 
 app = Flask(__name__)
 STATE = {"portal_fails": False, "cms_cache": None, "cms_cache_time": 0}
@@ -32,7 +33,7 @@ def build_view(column):
 
 @app.route("/")
 def index():
-    return '<a href="/cms">Public CMS page</a> | <a href="/portal">Booking portal</a> | <a href="/api/state">State JSON</a>'
+    return HOME
 
 @app.route("/cms")
 def cms():
@@ -93,5 +94,7 @@ app.register_blueprint(verify_bp)
 from testruns import bp as tests_bp
 app.register_blueprint(tests_bp)
 
+install(app)
+
 if __name__ == "__main__":
-    app.run(debug=True, port=5000)  
+    app.run(debug=True, port=5000)
