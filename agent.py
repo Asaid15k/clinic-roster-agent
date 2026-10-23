@@ -2,12 +2,14 @@
 Steps: collect -> parse (LLM, with rule-based fallback) -> detect conflicts -> build proposal.
 Nothing is changed here. Updates happen only after human approval (Day 3).
 """
-import os, re, json, uuid, datetime, sys
+import os, re, json, uuid, datetime, sys, time, threading
 from dotenv import load_dotenv
 from db import get_db
 
 load_dotenv()
 MODEL = "gemini-3.8-flash"
+LLM_TIMEOUT_MS = 10000      # give up on Gemini after 10 s and use the rule parser
+_CACHE = {}                 # same message -> same answer (temperature 0), so repeats are instant
 
 
 def ensure_tables(conn):
@@ -38,9 +40,15 @@ def load_context(conn):
 
 # ---------- parsing ----------
 def llm_parse(text, doctors, calendar):
+    """Returns (changes, label). Label shows how the answer was produced and how long it took."""
+    key = text.strip().lower()
+    if key in _CACHE:
+        return _CACHE[key], "gemini (cached)"
     from google import genai
     from google.genai import types
-    client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+    t0 = time.time()
+    client = genai.Client(api_key=os.environ["GEMINI_API_KEY"],
+                          http_options=types.HttpOptions(timeout=LLM_TIMEOUT_MS))
     system = (
         "You extract clinic roster changes from a message. Return ONLY JSON: "
         '{"changes":[{"doctor_name":string|null,"date":"YYYY-MM-DD"|null,"action":"leave"|"available"|null}]}. '
@@ -48,11 +56,18 @@ def llm_parse(text, doctors, calendar):
         f"Calendar (date: weekday): {json.dumps(calendar)}. "
         "Use null for anything not clearly stated. Never guess. One entry per doctor per date."
     )
-    resp = client.models.generate_content(
-        model=MODEL, contents=text,
-        config=types.GenerateContentConfig(system_instruction=system,
-                                           response_mime_type="application/json", temperature=0))
-    return json.loads(resp.text)["changes"]
+    base = dict(system_instruction=system, response_mime_type="application/json", temperature=0)
+    try:  # low thinking = much faster for a simple extraction task
+        cfg = types.GenerateContentConfig(**base, thinking_config=types.ThinkingConfig(thinking_level="low"))
+        resp = client.models.generate_content(model=MODEL, contents=text, config=cfg)
+    except Exception as e:
+        if "thinking" not in str(e).lower():
+            raise                              # timeouts and other errors go to the fallback parser
+        resp = client.models.generate_content(model=MODEL, contents=text,
+                                              config=types.GenerateContentConfig(**base))
+    changes = json.loads(resp.text)["changes"]
+    _CACHE[key] = changes
+    return changes, f"gemini ({time.time() - t0:.1f}s)"
 
 
 def rule_parse(text, doctors, calendar):
@@ -67,7 +82,7 @@ def rule_parse(text, doctors, calendar):
 
 def parse_input(text, doctors, calendar):
     try:
-        raw, parser = llm_parse(text, doctors, calendar), "gemini"
+        raw, parser = llm_parse(text, doctors, calendar)
     except Exception as e:
         raw, parser = rule_parse(text, doctors, calendar), f"rules (LLM failed: {type(e).__name__})"
     changes = []
@@ -110,7 +125,7 @@ def build_proposal(raw_text):
     log(conn, input_id, "collect", {"raw_text": raw_text}, "roster input form")
 
     changes, parser = parse_input(raw_text, doctors, calendar)
-    log(conn, input_id, "parse", {"parser": parser, "changes": changes}, MODEL if parser == "gemini" else "rule parser")
+    log(conn, input_id, "parse", {"parser": parser, "changes": changes}, MODEL if parser.startswith("gemini") else "rule parser")
 
     items = []
     for c in changes:
@@ -134,6 +149,25 @@ def build_proposal(raw_text):
     conn.commit()
     conn.close()
     return proposal
+
+
+def _prewarm():
+    """Ask Gemini the three demo messages once at startup, so they answer instantly later."""
+    try:
+        conn = get_db()
+        doctors, calendar = load_context(conn)
+        conn.close()
+        for t in ("Dr. Mehta is on leave Friday", "Dr. Khan on leave Tuesday", "Dr. Rao on leave Wednesday"):
+            try:
+                llm_parse(t, doctors, calendar)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+if __name__ != "__main__":
+    threading.Thread(target=_prewarm, daemon=True).start()
 
 
 if __name__ == "__main__":
